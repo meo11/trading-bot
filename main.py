@@ -8,38 +8,40 @@ app = Flask(__name__)
 CORS(app)
 
 # === CONFIG ===
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # New: Base directory
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # Base directory
 starting_equity = 10000
 trade_log_file = os.path.join(BASE_DIR, "simulated_trades.csv")
 equity_file = os.path.join(BASE_DIR, "equity_curve.csv")
 current_equity = starting_equity
 
+# === Initialize files if not exist ===
+if not os.path.exists(trade_log_file):
+    with open(trade_log_file, mode="w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["Symbol", "Action", "Price", "Order ID", "Time"])
+
+if not os.path.exists(equity_file):
+    with open(equity_file, mode="w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["Time", "Equity"])
+        writer.writerow([datetime.now().isoformat(), starting_equity])
 
 # === ROUTES ===
 @app.route('/')
 def home():
     return "✅ Trade Execution Simulation Server is running"
 
-
 @app.route('/download/trades')
 def download_trades():
     if not os.path.exists(trade_log_file):
-        return jsonify({
-            'status': 'error',
-            'message': 'Trades file not found'
-        }), 404
+        return jsonify({'status': 'error', 'message': 'Trades file not found'}), 404
     return send_file(trade_log_file, as_attachment=True)
-
 
 @app.route('/download/equity')
 def download_equity():
     if not os.path.exists(equity_file):
-        return jsonify({
-            'status': 'error',
-            'message': 'Equity file not found'
-        }), 404
+        return jsonify({'status': 'error', 'message': 'Equity file not found'}), 404
     return send_file(equity_file, as_attachment=True)
-
 
 @app.route('/debug/files')
 def debug_files():
@@ -49,30 +51,17 @@ def debug_files():
         "trades_file_exists": os.path.exists(trade_log_file)
     })
 
-
 # === Save Trade ===
 def save_trade_to_csv(symbol, action, price, order_id):
-    file_exists = os.path.exists(trade_log_file)
     with open(trade_log_file, mode="a", newline="") as file:
         writer = csv.writer(file)
-        if not file_exists:
-            writer.writerow(["Symbol", "Action", "Price", "Order ID", "Time"])
-        writer.writerow([
-            symbol,
-            action.upper(), price, order_id,
-            datetime.now().isoformat()
-        ])
-
+        writer.writerow([symbol, action.upper(), price, order_id, datetime.now().isoformat()])
 
 # === Save Equity ===
 def save_equity_to_csv(equity):
-    file_exists = os.path.exists(equity_file)
     with open(equity_file, mode="a", newline="") as file:
         writer = csv.writer(file)
-        if not file_exists:
-            writer.writerow(["Time", "Equity"])
         writer.writerow([datetime.now().isoformat(), equity])
-
 
 # === Simulate Equity Change ===
 def simulate_equity(price, action):
@@ -92,7 +81,6 @@ def simulate_equity(price, action):
         current_equity += pnl
         save_equity_to_csv(current_equity)
 
-
 # === WEBHOOK ===
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -109,13 +97,9 @@ def webhook():
         save_trade_to_csv(symbol, action, price, order_id)
         simulate_equity(price, action)
 
-        return jsonify({
-            'status': 'ok',
-            'message': 'Trade recorded and equity updated'
-        }), 200
+        return jsonify({'status': 'ok', 'message': 'Trade recorded and equity updated'}), 200
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
-
 
 # === START SERVER ===
 if __name__ == '__main__':
