@@ -1,0 +1,9 @@
+=== PERFORMANCE REPORT ===
+Initial Capital: $10,000.00
+Final Balance: $10,200.00
+Net Profit: $200.00
+Total Trades: 11
+Win Rate: 54.5%
+Average PnL: $18.18
+Max Drawdown: 2.5%
+Profit Factor: 1.85

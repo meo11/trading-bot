@@ -1,0 +1,8 @@
+flask
+flask-cors
+pandas
+numpy
+matplotlib
+plotly
+streamlit
+streamlit-autorefresh
