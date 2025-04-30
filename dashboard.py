@@ -186,4 +186,8 @@ else:
 
 # === Footer ===
 st.markdown("---")
+<<<<<<< HEAD
 st.markdown(f"<small>Dashboard last updated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</small>", unsafe_allow_html=True)
+=======
+st.markdown(f"<small>Dashboard last updated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</small>", unsafe_allow_html=True)
+>>>>>>> 85598eac (Update dashboard and add trade simulation scripts)
