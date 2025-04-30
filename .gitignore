@@ -1,0 +1,14 @@
+# Ignore virtual environments
+venv/
+.env
+
+# macOS system files
+.DS_Store
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Logs or outputs
+*.log
