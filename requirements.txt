@@ -7,3 +7,5 @@ plotly
 streamlit
 streamlit-autorefresh
 gunicorn
+oandapyV20
+python-dotenv
