@@ -1,12 +1,11 @@
+# main.py
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-from datetime import datetime, time as dtime
-from zoneinfo import ZoneInfo
-import os, csv, math, uuid, requests, re
+from datetime import datetime, timezone, date
+import os, csv, math, uuid, requests, json, pytz
 import oandapyV20
 import oandapyV20.endpoints.orders as orders
 import oandapyV20.endpoints.accounts as accounts
-import oandapyV20.endpoints.positions as positions
 from dotenv import load_dotenv
 from requests.auth import HTTPBasicAuth
 from time import time
@@ -16,16 +15,25 @@ app = Flask(__name__)
 CORS(app)
 load_dotenv()
 
-# === Execution Mode & Global Switch ===
-LOCAL_TEST = os.getenv("LOCAL_TEST", "true").lower() == "true"
-TRADING_ENABLED = os.getenv("TRADING_ENABLED", "true").lower() == "true"
+# ========== Execution Mode & Global Guards ==========
+LOCAL_TEST        = os.getenv("LOCAL_TEST", "true").lower() == "true"           # dry-switch inside server (also overridable per route)
+TRADING_ENABLED   = os.getenv("TRADING_ENABLED", "true").lower() == "true"      # global kill switch
 
-# === OANDA Config ===
-OANDA_TOKEN = os.getenv("OANDA_TOKEN")
-OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
+# Daily loss halt: percent of start-of-day NAV (e.g., 1.5 = 1.5%)
+DAILY_LOSS_STOP_PCT = float(os.getenv("DAILY_LOSS_STOP_PCT", "0"))              # 0 disables
+TRADING_TZ          = os.getenv("TRADING_TZ", "America/Halifax")                # timezone for daily starts & windows
+TRADING_WINDOW      = os.getenv("TRADING_WINDOW", "").strip()                   # e.g., "09:30-16:00" (local to TRADING_TZ); empty = disabled
+
+# Discord notifications
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+DISCORD_WEBHOOK_SET = os.getenv("DISCORD_WEBHOOK_SET", "false").lower() == "true" or bool(DISCORD_WEBHOOK_URL)
+
+# ========== OANDA Config ==========
+OANDA_TOKEN      = os.getenv("OANDA_TOKEN", "")
+OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "")
 FORWARD_TO_OANDA = os.getenv("FORWARD_TO_OANDA", "true").lower() == "true"
 
-# === Duplikium Config ===
+# ========== Duplikium Config ==========
 DUP_BASE   = (os.getenv("DUPLIKIUM_BASE") or "").rstrip("/")
 DUP_USER   = os.getenv("DUPLIKIUM_USER") or ""
 DUP_TOKEN  = os.getenv("DUPLIKIUM_TOKEN") or ""
@@ -39,98 +47,54 @@ def dup_headers():
         return {"Authorization": f"Bearer {DUP_TOKEN}", "Content-Type": "application/json"}
     if DUP_AUTH in ("headers", "token"):
         return {"X-Auth-Username": DUP_USER, "X-Auth-Token": DUP_TOKEN, "Content-Type": "application/json"}
-    return {"Content-Type": "application/json"}  # for basic
+    return {"Content-Type": "application/json"}  # for "basic", handled via auth()
 
 def dup_auth():
     return HTTPBasicAuth(DUP_USER, DUP_TOKEN) if DUP_AUTH == "basic" else None
 
-# === Discord Notify ===
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+# ========== Risk Config ==========
+MAX_RISK_PCT          = float(os.getenv("MAX_RISK_PCT", "0.50"))     # hard cap, e.g. 0.50% per trade
+MAX_UNITS             = int(os.getenv("MAX_UNITS", "300000"))        # absolute ceiling
+MASTER_START_BAL      = float(os.getenv("MASTER_START_BAL", "1000000"))
 
-def discord_notify(msg: str, level: str = "info", extra: dict | None = None):
-    """Fire-and-forget Discord webhook; safely no-op if not set."""
-    if not DISCORD_WEBHOOK_URL:
-        return
-    try:
-        color = 0x58a6ff if level == "info" else 0xf39c12 if level == "warn" else 0xe74c3c
-        embeds = [{
-            "title": f"[{level.upper()}] Trading Bot",
-            "description": msg[:1900],
-            "color": color,
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "fields": [{"name": k, "value": f"`{v}`", "inline": True} for k, v in (extra or {}).items()]
-        }]
-        requests.post(DISCORD_WEBHOOK_URL, json={"embeds": embeds}, timeout=5)
-    except Exception:
-        pass
-
-# === Risk Controls (env) ===
-MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", "0.50"))     # hard cap (percent of master balance)
-MAX_UNITS    = int(os.getenv("MAX_UNITS", "300000"))        # absolute units cap
-MASTER_START_BAL = float(os.getenv("MASTER_START_BAL", "1000000"))
-
-TRADING_TZ = os.getenv("TRADING_TZ", "America/Halifax")
-TRADING_WINDOW = os.getenv("TRADING_WINDOW", "").strip()    # e.g., "Mon-Fri 06:00-20:00"
-DAILY_LOSS_STOP_PCT = float(os.getenv("DAILY_LOSS_STOP_PCT", "1.5"))
-
-CAPS_RAW = os.getenv("SYMBOL_RISK_CAPS", "")
-SYMBOL_RISK_CAPS = {}
-if CAPS_RAW:
-    for kv in CAPS_RAW.split(","):
-        if ":" in kv:
-            k, v = kv.split(":", 1)
-            try:
-                SYMBOL_RISK_CAPS[k.strip().upper()] = float(v)
-            except:
-                pass
-
+# Allowlist (uppercased TV symbols)
 SYMBOL_ALLOW = [s.strip().upper() for s in os.getenv("SYMBOL_ALLOWLIST", "US30,NAS100,XAUUSD,EURUSD").split(",") if s.strip()]
 
-# NEW: concurrency & min SL env
-MAX_CONCURRENT_GLOBAL = int(os.getenv("MAX_CONCURRENT_GLOBAL", "3"))
-MAX_CONCURRENT_PER_SYMBOL = int(os.getenv("MAX_CONCURRENT_PER_SYMBOL", "2"))
-MIN_SL_RULES_RAW = os.getenv("MIN_SL_RULES", "").strip()   # e.g., "US30:50pts,XAUUSD:5pts,EURUSD:10pips"
-
-def parse_min_sl_rules(raw: str):
-    """
-    Parse rules like 'US30:50pts,XAUUSD:5pts,EURUSD:10pips'
-    Returns dict: { "US30": {"qty":50, "kind":"points"}, "EURUSD":{"qty":10,"kind":"pips"} }
-    """
-    out = {}
+# Per-symbol unit caps, JSON or comma form:
+# Example JSON: {"EURUSD": 100000, "XAUUSD": 5000, "US30": 5}
+def _parse_symbol_caps(raw: str):
     if not raw:
-        return out
-    for item in raw.split(","):
-        if ":" not in item:
-            continue
-        sym, rest = item.split(":", 1)
-        sym = sym.strip().upper()
-        rest = rest.strip().lower()
-        if rest.endswith("pips"):
+        return {}
+    raw = raw.strip()
+    try:
+        # Try JSON first
+        obj = json.loads(raw)
+        return {k.upper(): int(v) for k, v in obj.items()}
+    except Exception:
+        pass
+    # Fallback: "EURUSD:100000, XAUUSD:5000"
+    caps = {}
+    for part in raw.split(","):
+        if ":" in part:
+            k, v = part.split(":", 1)
+            k = k.strip().upper()
             try:
-                out[sym] = {"qty": float(rest.replace("pips","")), "kind": "pips"}
-            except: pass
-        elif rest.endswith("pts") or rest.endswith("points"):
-            try:
-                out[sym] = {"qty": float(re.sub(r"(pts|points)$","", rest)), "kind": "points"}
-            except: pass
-        elif rest.endswith("price"):
-            try:
-                out[sym] = {"qty": float(rest.replace("price","")), "kind": "price"}
-            except: pass
-    return out
+                caps[k] = int(v.strip())
+            except Exception:
+                pass
+    return caps
 
-MIN_SL_RULES = parse_min_sl_rules(MIN_SL_RULES_RAW)
+SYMBOL_RISK_CAPS = _parse_symbol_caps(os.getenv("SYMBOL_RISK_CAPS", ""))
 
-# === Symbol metadata & aliases (TradingView -> OANDA) ===
+# ========== Symbol metadata & aliases (TradingView -> OANDA) ==========
 SYMBOL_META = {
     "EUR_USD":   {"aliases": ["EURUSD", "FX:EURUSD", "OANDA:EURUSD"],             "kind": "fx",    "pip": 0.0001},
     "GBP_USD":   {"aliases": ["GBPUSD", "FX:GBPUSD", "OANDA:GBPUSD"],             "kind": "fx",    "pip": 0.0001},
     "USD_JPY":   {"aliases": ["USDJPY", "FX:USDJPY", "OANDA:USDJPY"],             "kind": "fx",    "pip": 0.01  },
     "XAU_USD":   {"aliases": ["XAUUSD","GOLD","OANDA:XAUUSD","FOREXCOM:XAUUSD"],  "kind": "metal", "point": 0.1},
-    "US30_USD":  {"aliases": ["US30","US30USD","OANDA:US30USD","DJI","US30CASH"], "kind": "index", "point": 1.0},
+    "US30_USD":  {"aliases": ["US30","US30USD","OANDA:US30USD","DJI","US30.CASH"],"kind": "index", "point": 1.0},
     "NAS100_USD":{"aliases": ["NAS100","US100","NAS100USD","OANDA:NAS100USD"],    "kind": "index", "point": 1.0},
 }
-POINT_VALUE = {"US30": 1.0, "NAS100": 1.0, "XAUUSD": 1.0}
 
 ALIAS_TO_OANDA = {}
 for o_sym, meta in SYMBOL_META.items():
@@ -143,6 +107,10 @@ def map_symbol(tv_symbol: str) -> str:
     return ALIAS_TO_OANDA.get(raw, raw)
 
 def to_price_delta(oanda_sym: str, qty: float, unit_type: str) -> float:
+    """
+    Convert a qty in 'pips' or 'points' to a price delta for the instrument.
+    If unit_type == 'price', returns qty as-is.
+    """
     unit_type = (unit_type or "").lower()
     if qty is None:
         return 0.0
@@ -165,11 +133,11 @@ def to_price_delta(oanda_sym: str, qty: float, unit_type: str) -> float:
     pip = meta.get("pip", 0.0001)
     return float(qty) * pip
 
-# === OANDA Balance Cache ===
+# ========== Live OANDA Balance Cache ==========
 _balance_cache = {"val": None, "ts": 0}
 
 def get_oanda_balance():
-    """Fetch live OANDA balance (cached ~15s). Fallback to MASTER_START_BAL if fails."""
+    """Fetch live OANDA NAV (cached ~15s). Falls back to MASTER_START_BAL if any read fails."""
     now = time()
     if _balance_cache["val"] is not None and now - _balance_cache["ts"] < 15:
         return _balance_cache["val"]
@@ -184,50 +152,17 @@ def get_oanda_balance():
         if not bal or bal <= 0:
             raise RuntimeError("Invalid balance from OANDA")
         _balance_cache["val"] = bal
-        _balance_cache["ts"] = now
+        _balance_cache["ts"]  = now
         return bal
     except Exception:
         return MASTER_START_BAL
 
-# === OANDA Open Positions (for concurrency) ===
-_pos_cache = {"by_symbol": {}, "ts": 0}
-
-def get_open_positions_counts():
-    """
-    Returns (global_count, per_symbol_counts) using OANDA OpenPositions.
-    Safe fallback to zeros on failure.
-    """
-    if not OANDA_TOKEN or not OANDA_ACCOUNT_ID:
-        return 0, {}
-    now = time()
-    try:
-        # light cache (5s)
-        if _pos_cache["by_symbol"] and now - _pos_cache["ts"] < 5:
-            d = _pos_cache["by_symbol"]
-            return sum(d.values()), dict(d)
-
-        client = oandapyV20.API(access_token=OANDA_TOKEN, environment="practice")
-        req = positions.OpenPositions(accountID=OANDA_ACCOUNT_ID)
-        resp = client.request(req)
-        per = {}
-        for p in resp.get("positions", []):
-            inst = p.get("instrument")
-            # Count as 1 if long or short units non-zero
-            long_units  = float(p.get("long", {}).get("units", "0"))
-            short_units = float(p.get("short", {}).get("units", "0"))
-            if abs(long_units) > 0 or abs(short_units) > 0:
-                per[inst] = per.get(inst, 0) + 1
-        _pos_cache["by_symbol"] = per
-        _pos_cache["ts"] = now
-        return sum(per.values()), per
-    except Exception:
-        return 0, {}
-
-# === Local Sim/Logs ===
+# ========== Local Sim/Logs ==========
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 starting_equity = 10000
 trade_log_file = os.path.join(BASE_DIR, "simulated_trades.csv")
 equity_file = os.path.join(BASE_DIR, "equity_curve.csv")
+daily_nav_file = os.path.join(BASE_DIR, "daily_nav.json")
 current_equity = starting_equity
 
 if not os.path.exists(trade_log_file):
@@ -263,107 +198,103 @@ def simulate_equity(price, action):
         current_equity += pnl
         save_equity_to_csv(current_equity)
 
-# === Timezone helpers & daily loss / trading window ===
-def tznow():
-    return datetime.now(ZoneInfo(TRADING_TZ))
-
-def today_key():
-    return tznow().strftime("%Y-%m-%d")
-
-def start_of_day_equity():
-    """Return first equity row for today (in TRADING_TZ). Fallback to last known, else starting."""
-    if not os.path.exists(equity_file):
-        return starting_equity
-    sod = None
-    with open(equity_file, "r") as f:
-        rows = list(csv.reader(f))
-    for r in rows[1:]:
-        try:
-            t = datetime.fromisoformat(r[0].replace("Z", ""))
-            t_local = t.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo(TRADING_TZ))
-            if t_local.date() == tznow().date():
-                sod = float(r[1]); break
-        except:
-            continue
-    if sod is not None:
-        return sod
-    try:
-        return float(rows[-1][1])
-    except:
-        return starting_equity
-
-def latest_equity():
-    if not os.path.exists(equity_file):
-        return starting_equity
-    with open(equity_file, "r") as f:
-        rows = list(csv.reader(f))
-    try:
-        return float(rows[-1][1])
-    except:
-        return starting_equity
-
-def day_loss_pct():
-    sod = start_of_day_equity()
-    cur = latest_equity()
-    if sod <= 0:
-        return 0.0
-    return max(0.0, (sod - cur) / sod * 100.0)
-
-def in_trading_window() -> bool:
+# ========== Trading Window & Daily-Loss Guard ==========
+def trading_window_ok(now_utc: datetime) -> bool:
+    """If TRADING_WINDOW set (e.g. '09:30-16:00'), enforce local time window in TRADING_TZ."""
     if not TRADING_WINDOW:
         return True
-    # e.g., "Mon-Fri 06:00-20:00"
-    m = re.match(r"(?i)^\s*(Mon|Tue|Wed|Thu|Fri|Sat|Sun)(?:-(Mon|Tue|Wed|Thu|Fri|Sat|Sun))?\s+(\d{2}:\d{2})-(\d{2}:\d{2})\s*$", TRADING_WINDOW)
-    if not m:
-        return True
-    start_day, end_day, start_hhmm, end_hhmm = m.groups()
-    days = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
-    s_idx = days.index(start_day[:3].title())
-    e_idx = days.index((end_day or start_day)[:3].title())
-    today_idx = tznow().weekday()  # Mon=0
+    try:
+        tz = pytz.timezone(TRADING_TZ)
+        local_now = now_utc.astimezone(tz)
+        start_s, end_s = TRADING_WINDOW.split("-", 1)
+        start_h, start_m = [int(x) for x in start_s.split(":")]
+        end_h, end_m     = [int(x) for x in end_s.split(":")]
+        start_dt = local_now.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
+        end_dt   = local_now.replace(hour=end_h,   minute=end_m,   second=0, microsecond=0)
+        return start_dt <= local_now <= end_dt
+    except Exception:
+        return True  # fail open if window parsing fails
 
-    if s_idx <= e_idx:
-        allowed = set(range(s_idx, e_idx+1))
-    else:
-        allowed = set(list(range(s_idx,7)) + list(range(0,e_idx+1)))
+def _read_daily_nav():
+    try:
+        with open(daily_nav_file, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
-    if today_idx not in allowed:
-        return False
+def _write_daily_nav(obj):
+    try:
+        with open(daily_nav_file, "w") as f:
+            json.dump(obj, f)
+    except Exception:
+        pass
 
-    hh, mm = map(int, start_hhmm.split(":"))
-    st = dtime(hh, mm)
-    hh, mm = map(int, end_hhmm.split(":"))
-    et = dtime(hh, mm)
-    nowt = tznow().time()
-    return st <= nowt <= et
+def daily_loss_guard(now_utc: datetime) -> (bool, dict):
+    """
+    Freeze trading if current NAV has dropped below (1 - DAILY_LOSS_STOP_PCT%) of start-of-day NAV.
+    Returns (ok, info_dict).
+    """
+    if DAILY_LOSS_STOP_PCT <= 0:
+        return True, {"enabled": False}
+    tz = pytz.timezone(TRADING_TZ)
+    local_today = now_utc.astimezone(tz).date().isoformat()
 
-# === Sizing & risk clamp ===
+    data = _read_daily_nav()
+    sod = data.get("start_nav", None)
+    sod_date = data.get("date", None)
+
+    nav_now = get_oanda_balance()
+
+    # reset SOD on new local date or missing record
+    if (sod is None) or (sod_date != local_today):
+        data = {"date": local_today, "start_nav": nav_now}
+        _write_daily_nav(data)
+        return True, {"enabled": True, "start_nav": nav_now, "nav_now": nav_now, "drawdown_pct": 0.0, "limit_pct": DAILY_LOSS_STOP_PCT}
+
+    # check drawdown
+    start_nav = float(data["start_nav"])
+    if start_nav <= 0:
+        return True, {"enabled": True, "start_nav": start_nav, "nav_now": nav_now, "drawdown_pct": 0.0, "limit_pct": DAILY_LOSS_STOP_PCT}
+    dd_pct = max(0.0, (start_nav - nav_now) / start_nav * 100.0)
+    ok = dd_pct < DAILY_LOSS_STOP_PCT
+    return ok, {"enabled": True, "start_nav": start_nav, "nav_now": nav_now, "drawdown_pct": round(dd_pct, 4), "limit_pct": DAILY_LOSS_STOP_PCT}
+
+# ========== Sizing ==========
 def clamp_units(units: int) -> int:
     return max(1, min(int(units), MAX_UNITS))
 
-def clamp_risk(tv_symbol: str, requested_pct: float) -> float:
-    pct = min(float(requested_pct or 0.0), MAX_RISK_PCT)
-    cap = SYMBOL_RISK_CAPS.get((tv_symbol or "").upper())
-    if cap is not None:
-        pct = min(pct, cap)
-    return max(0.0, pct)
+def apply_symbol_cap(units: int, tv_symbol: str) -> int:
+    cap = SYMBOL_RISK_CAPS.get(tv_symbol.upper())
+    if cap is None:
+        return units
+    return max(1, min(int(units), int(cap)))
 
 def size_for_risk(tv_symbol, balance, risk_pct, entry, sl_price):
     """
     Very simple risk model using price distance to SL:
     risk_dollars ≈ units * abs(entry - SL)  =>  units ≈ risk_dollars / price_delta
+    - clamps risk_pct to MAX_RISK_PCT
+    - clamps units to MAX_UNITS
+    - clamps units to SYMBOL_RISK_CAPS[tv_symbol] if provided
     """
-    applied_pct = clamp_risk(tv_symbol, risk_pct)
+    requested = float(risk_pct or 0.0)
+    risk_used = min(requested, MAX_RISK_PCT)
     if not sl_price or sl_price == entry:
-        return clamp_units(1), applied_pct
+        base = clamp_units(1)
+        return apply_symbol_cap(base, tv_symbol)
+
     price_delta = abs(entry - sl_price)
     if price_delta <= 0:
-        return clamp_units(1), applied_pct
-    risk_dollars = float(balance) * (applied_pct / 100.0)
-    units = risk_dollars / price_delta
-    return clamp_units(math.floor(units)), applied_pct
+        base = clamp_units(1)
+        return apply_symbol_cap(base, tv_symbol)
 
-# === OANDA Execution ===
+    risk_dollars = float(balance) * (risk_used / 100.0)
+    units = math.floor(risk_dollars / price_delta)
+    units = clamp_units(units)
+    units = apply_symbol_cap(units, tv_symbol)
+    return units
+
+# ========== OANDA Execution ==========
 def place_oanda_order(symbol, action, units=1):
     if LOCAL_TEST or not FORWARD_TO_OANDA or not TRADING_ENABLED:
         return True, "OANDA not called (LOCAL_TEST / forwarding disabled / trading disabled)"
@@ -383,7 +314,7 @@ def place_oanda_order(symbol, action, units=1):
     except Exception as e:
         return False, f"❌ OANDA order failed: {str(e)}"
 
-# === Duplikium Forward ===
+# ========== Duplikium Forward ==========
 def forward_to_duplikium(master_source, instrument, side, entry, sl_p, tp_p, units, tag="tv_v1"):
     if LOCAL_TEST or not FORWARD_TO_DUP or not TRADING_ENABLED:
         return True, 200, "Duplikium not called (LOCAL_TEST / forwarding disabled / trading disabled)"
@@ -393,29 +324,50 @@ def forward_to_duplikium(master_source, instrument, side, entry, sl_p, tp_p, uni
     payload = {
         "source": master_source,
         "symbol": instrument,
-        "side": side,
+        "side": side,                 # BUY / SELL
         "orderType": "MARKET",
-        "units": units,
+        "units": units,               # master size; slaves scale in Duplikium
         "entryPrice": entry,
         "slPrice": sl_p,
         "tpPrice": tp_p,
         "clientOrderId": f"{tag}-{uuid.uuid4().hex[:8]}",
-        "comment": f"TV->{master_source} {datetime.utcnow().isoformat()}"
+        "comment": f"TV->{master_source} {datetime.now(timezone.utc).isoformat()}"
     }
 
     url = f"{DUP_BASE}{DUP_PATH}"
     try:
-        resp = requests.post(url, json=payload, headers=dup_headers(), auth=dup_auth(), timeout=10)
+        resp = requests.post(url, json=payload, headers=dup_headers(), auth=dup_auth(), timeout=12)
         return resp.ok, resp.status_code, resp.text
     except Exception as e:
         return False, 500, str(e)
 
-# === Idempotency (avoid duplicate fills) ===
+# ========== Discord Notify ==========
+def notify_discord(title: str, fields: dict, color: int = 0x2ecc71):
+    """Post a clean embed to Discord (no-op if not configured)."""
+    if not DISCORD_WEBHOOK_SET or not DISCORD_WEBHOOK_URL:
+        return False, "discord disabled"
+    try:
+        embed_fields = [{"name": k, "value": str(v), "inline": True} for k, v in fields.items()]
+        payload = {
+            "embeds": [{
+                "title": title,
+                "color": color,
+                "fields": embed_fields,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }]
+        }
+        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=8)
+        return r.ok, r.text
+    except Exception as e:
+        return False, str(e)
+
+# ========== Idempotency (avoid duplicate fills) ==========
 LAST_SEEN = {}
 ID_TTL = 90  # seconds
 
 def seen(order_id: str) -> bool:
     now = time()
+    # purge old
     for k, t in list(LAST_SEEN.items()):
         if now - t > ID_TTL:
             LAST_SEEN.pop(k, None)
@@ -426,7 +378,7 @@ def seen(order_id: str) -> bool:
     LAST_SEEN[order_id] = now
     return False
 
-# === Routes ===
+# ========== Routes ==========
 @app.route('/')
 def home():
     return "✅ Trade Execution Server is running"
@@ -439,19 +391,14 @@ def env_check():
     return jsonify({
         "LOCAL_TEST": LOCAL_TEST,
         "TRADING_ENABLED": TRADING_ENABLED,
+        "DAILY_LOSS_STOP_PCT": DAILY_LOSS_STOP_PCT,
+        "TRADING_TZ": TRADING_TZ,
+        "TRADING_WINDOW": TRADING_WINDOW,
         "MAX_RISK_PCT": MAX_RISK_PCT,
         "MAX_UNITS": MAX_UNITS,
         "MASTER_START_BAL": MASTER_START_BAL,
         "FORWARD_TO_OANDA": FORWARD_TO_OANDA,
         "FORWARD_TO_DUPLIKIUM": FORWARD_TO_DUP,
-        "TRADING_TZ": TRADING_TZ,
-        "TRADING_WINDOW": TRADING_WINDOW,
-        "DAILY_LOSS_STOP_PCT": DAILY_LOSS_STOP_PCT,
-        "SYMBOL_RISK_CAPS": SYMBOL_RISK_CAPS,
-        "SYMBOL_ALLOWLIST": SYMBOL_ALLOW,
-        "MAX_CONCURRENT_GLOBAL": MAX_CONCURRENT_GLOBAL,
-        "MAX_CONCURRENT_PER_SYMBOL": MAX_CONCURRENT_PER_SYMBOL,
-        "MIN_SL_RULES": MIN_SL_RULES,
         "OANDA_ACCOUNT_ID": OANDA_ACCOUNT_ID,
         "OANDA_TOKEN": mask(OANDA_TOKEN),
         "DUPLIKIUM_BASE": DUP_BASE,
@@ -459,30 +406,26 @@ def env_check():
         "DUPLIKIUM_TOKEN": mask(DUP_TOKEN),
         "DUPLIKIUM_AUTH_STYLE": DUP_AUTH,
         "DUPLIKIUM_ORDERS_PATH": DUP_PATH,
-        "DISCORD_WEBHOOK_SET": bool(DISCORD_WEBHOOK_URL),
+        "SYMBOL_ALLOWLIST": SYMBOL_ALLOW,
+        "SYMBOL_RISK_CAPS": SYMBOL_RISK_CAPS,
+        "DISCORD_WEBHOOK_SET": DISCORD_WEBHOOK_SET
     })
 
 @app.route('/risk-status')
 def risk_status():
     bal = get_oanda_balance()
-    g_count, per_counts = get_open_positions_counts()
+    now_utc = datetime.now(timezone.utc)
+    tw_ok = trading_window_ok(now_utc)
+    dl_ok, dl_info = daily_loss_guard(now_utc)
     return jsonify({
         "oanda_balance": bal,
-        "start_of_day_equity": start_of_day_equity(),
-        "latest_equity": latest_equity(),
-        "day_loss_pct": round(day_loss_pct(), 4),
-        "trading_window": TRADING_WINDOW or "(none)",
-        "in_trading_window_now": in_trading_window(),
-        "open_positions_total": g_count,
-        "open_positions_by_instrument": per_counts,
-        "TRADING_ENABLED": TRADING_ENABLED,
         "MAX_RISK_PCT": MAX_RISK_PCT,
         "MAX_UNITS": MAX_UNITS,
-        "SYMBOL_RISK_CAPS": SYMBOL_RISK_CAPS,
         "SYMBOL_ALLOWLIST": SYMBOL_ALLOW,
-        "MAX_CONCURRENT_GLOBAL": MAX_CONCURRENT_GLOBAL,
-        "MAX_CONCURRENT_PER_SYMBOL": MAX_CONCURRENT_PER_SYMBOL,
-        "MIN_SL_RULES": MIN_SL_RULES,
+        "SYMBOL_RISK_CAPS": SYMBOL_RISK_CAPS,
+        "trading_window_ok": tw_ok,
+        "daily_loss_ok": dl_ok,
+        "daily_loss_info": dl_info
     })
 
 @app.route('/download/trades')
@@ -502,7 +445,8 @@ def debug_files():
     return jsonify({
         "files": os.listdir(BASE_DIR),
         "equity_file_exists": os.path.exists(equity_file),
-        "trades_file_exists": os.path.exists(trade_log_file)
+        "trades_file_exists": os.path.exists(trade_log_file),
+        "daily_nav_file_exists": os.path.exists(daily_nav_file)
     })
 
 @app.route('/dryrun', methods=['POST'])
@@ -520,29 +464,21 @@ def dryrun():
     sl_q    = float(data.get('sl', 150))
     tp_type = data.get('tp_type', 'points')
     tp_q    = float(data.get('tp', 300))
-    risk_req= float(data.get('risk_pct', 0.05))
+    risk_pct= float(data.get('risk_pct', 0.05))
 
     instrument = map_symbol(tv_symbol)
-
-    # Min SL enforcement (dryrun)
-    min_rule = MIN_SL_RULES.get(tv_symbol)
-    if min_rule and sl_q is not None:
-        req_delta = to_price_delta(instrument, min_rule["qty"], min_rule["kind"])
-        got_delta = to_price_delta(instrument, sl_q, sl_type)
-        if got_delta < req_delta:
-            return jsonify({'status':'error','message':f'Min SL for {tv_symbol} is {min_rule["qty"]}{min_rule["kind"]}, provided is smaller'}), 400
-
     sl_delta = to_price_delta(instrument, sl_q, sl_type)
     tp_delta = to_price_delta(instrument, tp_q, tp_type)
     sl_p = price - sl_delta if side == "BUY" else price + sl_delta
     tp_p = price + tp_delta if side == "BUY" else price - tp_delta
 
     balance = get_oanda_balance()
-    units, risk_applied = size_for_risk(tv_symbol, balance, risk_req, price, sl_p)
+    units = size_for_risk(tv_symbol, balance, risk_pct, price, sl_p)
 
-    # Concurrency preview
-    g_count, per_counts = get_open_positions_counts()
-    per_count = per_counts.get(instrument, 0)
+    # guards snapshot
+    now_utc = datetime.now(timezone.utc)
+    tw_ok = trading_window_ok(now_utc)
+    dl_ok, dl_info = daily_loss_guard(now_utc)
 
     return jsonify({
         "side": side,
@@ -550,13 +486,16 @@ def dryrun():
         "instrument": instrument,
         "entry": price,
         "slPrice": sl_p, "tpPrice": tp_p,
-        "risk_pct_requested": risk_req,
-        "risk_pct_applied": risk_applied,
+        "risk_pct_requested": risk_pct,
+        "risk_pct_applied": min(risk_pct, MAX_RISK_PCT),
         "units": units,
-        "open_positions_total": g_count,
-        "open_positions_for_instrument": per_count,
         "LOCAL_TEST": LOCAL_TEST,
-        "note": "dry run only; nothing sent"
+        "trading_window_ok": tw_ok,
+        "daily_loss_ok": dl_ok,
+        "daily_loss_info": dl_info,
+        "note": "dry run only; nothing sent",
+        "open_positions_for_instrument": 0,
+        "open_positions_total": 0
     })
 
 @app.route('/webhook', methods=['POST'])
@@ -577,56 +516,45 @@ def webhook():
 
         price = float(data.get('price'))
         order_id = data.get('order_id') or f"tv-{uuid.uuid4().hex[:8]}"
+
+        # Idempotency
         if seen(order_id):
             return jsonify({'status': 'ignored', 'reason': 'duplicate order_id'}), 200
 
-        # --- hard guards ---
-        if not TRADING_ENABLED:
+        # Trading window & daily drawdown guard
+        now_utc = datetime.now(timezone.utc)
+        if not trading_window_ok(now_utc):
             save_trade_to_csv(tv_symbol, side, price, order_id)  # still log
-            discord_notify("Trade skipped: TRADING_ENABLED=false",
-                           "warn", {"symbol": tv_symbol, "price": price, "order_id": order_id})
+            notify_discord("⛔ Blocked by Trading Window", {
+                "symbol": tv_symbol, "side": side, "price": price, "order_id": order_id
+            }, color=0xe67e22)
+            return jsonify({'status': 'skipped', 'reason': 'outside trading window'}), 200
+
+        dl_ok, dl_info = daily_loss_guard(now_utc)
+        if not dl_ok:
+            save_trade_to_csv(tv_symbol, side, price, order_id)
+            notify_discord("⛔ Blocked by Daily Loss Stop", {
+                "symbol": tv_symbol, "side": side, "price": price, **dl_info
+            }, color=0xe74c3c)
+            return jsonify({'status': 'skipped', 'reason': 'daily loss stop hit', 'daily_loss_info': dl_info}), 200
+
+        if not TRADING_ENABLED:
+            save_trade_to_csv(tv_symbol, side, price, order_id)
+            notify_discord("⚠️ Trading Disabled", {
+                "symbol": tv_symbol, "side": side, "price": price, "order_id": order_id
+            }, color=0xf1c40f)
             return jsonify({'status': 'skipped', 'reason': 'TRADING_ENABLED=false'}), 200
-
-        if not in_trading_window():
-            discord_notify("Trade blocked: outside trading window",
-                           "warn", {"symbol": tv_symbol, "price": price})
-            return jsonify({'status': 'error', 'message': 'Outside TRADING_WINDOW'}), 403
-
-        dlp = day_loss_pct()
-        if DAILY_LOSS_STOP_PCT > 0 and dlp >= DAILY_LOSS_STOP_PCT:
-            discord_notify("Trade blocked: daily loss stop hit",
-                           "error", {"day_loss_pct": dlp, "limit": DAILY_LOSS_STOP_PCT})
-            return jsonify({'status':'error','message':f'Daily loss stop hit ({dlp:.2f}% >= {DAILY_LOSS_STOP_PCT:.2f}%)'}), 403
-
-        # Concurrency guard
-        instrument = map_symbol(tv_symbol)
-        g_count, per_counts = get_open_positions_counts()
-        per_count = per_counts.get(instrument, 0)
-        if MAX_CONCURRENT_GLOBAL and g_count >= MAX_CONCURRENT_GLOBAL:
-            discord_notify("Trade blocked: max concurrent (global) reached",
-                           "warn", {"open_total": g_count, "limit": MAX_CONCURRENT_GLOBAL})
-            return jsonify({'status':'error','message': f'Max concurrent trades (global) reached: {g_count}/{MAX_CONCURRENT_GLOBAL}'}), 403
-        if MAX_CONCURRENT_PER_SYMBOL and per_count >= MAX_CONCURRENT_PER_SYMBOL:
-            discord_notify("Trade blocked: max concurrent (per symbol) reached",
-                           "warn", {"instrument": instrument, "open_for_symbol": per_count, "limit": MAX_CONCURRENT_PER_SYMBOL})
-            return jsonify({'status':'error','message': f'Max concurrent trades for {instrument} reached: {per_count}/{MAX_CONCURRENT_PER_SYMBOL}'}), 403
 
         # optional SL/TP & risk from payload
         sl_type = (data.get('sl_type') or "points")
         tp_type = (data.get('tp_type') or "points")
         sl_q  = float(data['sl']) if 'sl' in data and data['sl'] is not None else None
         tp_q  = float(data['tp']) if 'tp' in data and data['tp'] is not None else None
-        risk_req = float(data.get('risk_pct', 0.05))
+        risk_pct_req = float(data.get('risk_pct', 0.05))
+        risk_pct_applied = min(risk_pct_req, MAX_RISK_PCT)
 
-        # Min SL enforcement
-        min_rule = MIN_SL_RULES.get(tv_symbol)
-        if min_rule and sl_q is not None:
-            req_delta = to_price_delta(instrument, min_rule["qty"], min_rule["kind"])
-            got_delta = to_price_delta(instrument, sl_q, sl_type)
-            if got_delta < req_delta:
-                discord_notify("Trade blocked: SL below minimum",
-                               "warn", {"symbol": tv_symbol, "min": f'{min_rule["qty"]}{min_rule["kind"]}', "got": f'{sl_q}{sl_type}'})
-                return jsonify({'status':'error','message':f'Min SL for {tv_symbol} is {min_rule["qty"]}{min_rule["kind"]}, provided is smaller'}), 400
+        # symbol mapping
+        instrument = map_symbol(tv_symbol)
 
         # compute SL/TP prices via deltas
         sl_p = None; tp_p = None
@@ -637,9 +565,9 @@ def webhook():
             d = to_price_delta(instrument, tp_q, tp_type)
             tp_p = price + d if side == "BUY" else price - d
 
-        # risk sizing (live balance) — NOTE: risk clamp happens here
+        # risk sizing (live balance)
         balance = get_oanda_balance()
-        units, risk_applied = size_for_risk(tv_symbol, balance, risk_req, price, sl_p)
+        units = size_for_risk(tv_symbol, balance, risk_pct_applied, price, sl_p)
 
         # log locally
         save_trade_to_csv(tv_symbol, side, price, order_id)
@@ -651,31 +579,40 @@ def webhook():
 
         status = 'ok' if (oanda_ok and dup_ok) else 'partial' if (oanda_ok or dup_ok) else 'error'
 
-        if status != 'error':
-            discord_notify("Trade executed" if status=='ok' else "Trade partially executed",
-                           "info", {"symbol": tv_symbol, "side": side, "units": units,
-                                    "risk_applied%": risk_applied, "oanda": oanda_ok, "duplikium": dup_ok})
+        # Discord notify
+        notify_discord(
+            "📈 New Signal" if status != 'error' else "❌ Execution Error",
+            {
+                "status": status,
+                "symbol": tv_symbol,
+                "instrument": instrument,
+                "side": side,
+                "price": price,
+                "units": units,
+                "risk_pct": risk_pct_applied,
+                "sl": sl_p, "tp": tp_p,
+                "oanda": oanda_msg,
+                "duplikium_status": dup_status,
+            },
+            color=(0x2ecc71 if status == 'ok' else 0xf39c12 if status == 'partial' else 0xe74c3c)
+        )
 
         return jsonify({
             'status': status,
             'LOCAL_TEST': LOCAL_TEST,
             'TRADING_ENABLED': TRADING_ENABLED,
+            'risk_pct_applied': risk_pct_applied,
             'oanda': oanda_msg,
             'duplikium_status': dup_status,
             'duplikium_msg': dup_msg,
             'sent_units': units,
             'tv_symbol': tv_symbol,
             'instrument': instrument,
-            'slPrice': sl_p, 'tpPrice': tp_p,
-            'risk_pct_requested': risk_req,
-            'risk_pct_applied': risk_applied,
-            'day_loss_pct': round(dlp, 3),
-            'open_positions_total': g_count,
-            'open_positions_for_instrument': per_count
+            'slPrice': sl_p, 'tpPrice': tp_p
         }), 200 if status != 'error' else 500
 
     except Exception as e:
-        discord_notify(f"Webhook error: {e}", "error")
+        notify_discord("❌ Webhook Exception", {"error": str(e)}, color=0xe74c3c)
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 # === Run (local dev) ===
