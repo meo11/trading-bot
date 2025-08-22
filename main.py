@@ -6,6 +6,7 @@ import os, csv, math, uuid, requests, re
 import oandapyV20
 import oandapyV20.endpoints.orders as orders
 import oandapyV20.endpoints.accounts as accounts
+import oandapyV20.endpoints.positions as positions
 from dotenv import load_dotenv
 from requests.auth import HTTPBasicAuth
 from time import time
@@ -72,7 +73,6 @@ TRADING_TZ = os.getenv("TRADING_TZ", "America/Halifax")
 TRADING_WINDOW = os.getenv("TRADING_WINDOW", "").strip()    # e.g., "Mon-Fri 06:00-20:00"
 DAILY_LOSS_STOP_PCT = float(os.getenv("DAILY_LOSS_STOP_PCT", "1.5"))
 
-# Per-symbol risk caps: "US30:0.20,NAS100:0.20,XAUUSD:0.15,EURUSD:0.50"
 CAPS_RAW = os.getenv("SYMBOL_RISK_CAPS", "")
 SYMBOL_RISK_CAPS = {}
 if CAPS_RAW:
@@ -85,6 +85,41 @@ if CAPS_RAW:
                 pass
 
 SYMBOL_ALLOW = [s.strip().upper() for s in os.getenv("SYMBOL_ALLOWLIST", "US30,NAS100,XAUUSD,EURUSD").split(",") if s.strip()]
+
+# NEW: concurrency & min SL env
+MAX_CONCURRENT_GLOBAL = int(os.getenv("MAX_CONCURRENT_GLOBAL", "3"))
+MAX_CONCURRENT_PER_SYMBOL = int(os.getenv("MAX_CONCURRENT_PER_SYMBOL", "2"))
+MIN_SL_RULES_RAW = os.getenv("MIN_SL_RULES", "").strip()   # e.g., "US30:50pts,XAUUSD:5pts,EURUSD:10pips"
+
+def parse_min_sl_rules(raw: str):
+    """
+    Parse rules like 'US30:50pts,XAUUSD:5pts,EURUSD:10pips'
+    Returns dict: { "US30": {"qty":50, "kind":"points"}, "EURUSD":{"qty":10,"kind":"pips"} }
+    """
+    out = {}
+    if not raw:
+        return out
+    for item in raw.split(","):
+        if ":" not in item:
+            continue
+        sym, rest = item.split(":", 1)
+        sym = sym.strip().upper()
+        rest = rest.strip().lower()
+        if rest.endswith("pips"):
+            try:
+                out[sym] = {"qty": float(rest.replace("pips","")), "kind": "pips"}
+            except: pass
+        elif rest.endswith("pts") or rest.endswith("points"):
+            try:
+                out[sym] = {"qty": float(re.sub(r"(pts|points)$","", rest)), "kind": "points"}
+            except: pass
+        elif rest.endswith("price"):
+            try:
+                out[sym] = {"qty": float(rest.replace("price","")), "kind": "price"}
+            except: pass
+    return out
+
+MIN_SL_RULES = parse_min_sl_rules(MIN_SL_RULES_RAW)
 
 # === Symbol metadata & aliases (TradingView -> OANDA) ===
 SYMBOL_META = {
@@ -154,6 +189,40 @@ def get_oanda_balance():
     except Exception:
         return MASTER_START_BAL
 
+# === OANDA Open Positions (for concurrency) ===
+_pos_cache = {"by_symbol": {}, "ts": 0}
+
+def get_open_positions_counts():
+    """
+    Returns (global_count, per_symbol_counts) using OANDA OpenPositions.
+    Safe fallback to zeros on failure.
+    """
+    if not OANDA_TOKEN or not OANDA_ACCOUNT_ID:
+        return 0, {}
+    now = time()
+    try:
+        # light cache (5s)
+        if _pos_cache["by_symbol"] and now - _pos_cache["ts"] < 5:
+            d = _pos_cache["by_symbol"]
+            return sum(d.values()), dict(d)
+
+        client = oandapyV20.API(access_token=OANDA_TOKEN, environment="practice")
+        req = positions.OpenPositions(accountID=OANDA_ACCOUNT_ID)
+        resp = client.request(req)
+        per = {}
+        for p in resp.get("positions", []):
+            inst = p.get("instrument")
+            # Count as 1 if long or short units non-zero
+            long_units  = float(p.get("long", {}).get("units", "0"))
+            short_units = float(p.get("short", {}).get("units", "0"))
+            if abs(long_units) > 0 or abs(short_units) > 0:
+                per[inst] = per.get(inst, 0) + 1
+        _pos_cache["by_symbol"] = per
+        _pos_cache["ts"] = now
+        return sum(per.values()), per
+    except Exception:
+        return 0, {}
+
 # === Local Sim/Logs ===
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 starting_equity = 10000
@@ -211,7 +280,6 @@ def start_of_day_equity():
     for r in rows[1:]:
         try:
             t = datetime.fromisoformat(r[0].replace("Z", ""))
-            # naive→assume local write timezone; treat as UTC then convert—best effort
             t_local = t.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo(TRADING_TZ))
             if t_local.date() == tznow().date():
                 sod = float(r[1]); break
@@ -325,9 +393,9 @@ def forward_to_duplikium(master_source, instrument, side, entry, sl_p, tp_p, uni
     payload = {
         "source": master_source,
         "symbol": instrument,
-        "side": side,                 # BUY / SELL
+        "side": side,
         "orderType": "MARKET",
-        "units": units,               # master size; slaves scale in Duplikium
+        "units": units,
         "entryPrice": entry,
         "slPrice": sl_p,
         "tpPrice": tp_p,
@@ -381,6 +449,9 @@ def env_check():
         "DAILY_LOSS_STOP_PCT": DAILY_LOSS_STOP_PCT,
         "SYMBOL_RISK_CAPS": SYMBOL_RISK_CAPS,
         "SYMBOL_ALLOWLIST": SYMBOL_ALLOW,
+        "MAX_CONCURRENT_GLOBAL": MAX_CONCURRENT_GLOBAL,
+        "MAX_CONCURRENT_PER_SYMBOL": MAX_CONCURRENT_PER_SYMBOL,
+        "MIN_SL_RULES": MIN_SL_RULES,
         "OANDA_ACCOUNT_ID": OANDA_ACCOUNT_ID,
         "OANDA_TOKEN": mask(OANDA_TOKEN),
         "DUPLIKIUM_BASE": DUP_BASE,
@@ -394,6 +465,7 @@ def env_check():
 @app.route('/risk-status')
 def risk_status():
     bal = get_oanda_balance()
+    g_count, per_counts = get_open_positions_counts()
     return jsonify({
         "oanda_balance": bal,
         "start_of_day_equity": start_of_day_equity(),
@@ -401,11 +473,16 @@ def risk_status():
         "day_loss_pct": round(day_loss_pct(), 4),
         "trading_window": TRADING_WINDOW or "(none)",
         "in_trading_window_now": in_trading_window(),
+        "open_positions_total": g_count,
+        "open_positions_by_instrument": per_counts,
         "TRADING_ENABLED": TRADING_ENABLED,
         "MAX_RISK_PCT": MAX_RISK_PCT,
         "MAX_UNITS": MAX_UNITS,
         "SYMBOL_RISK_CAPS": SYMBOL_RISK_CAPS,
-        "SYMBOL_ALLOWLIST": SYMBOL_ALLOW
+        "SYMBOL_ALLOWLIST": SYMBOL_ALLOW,
+        "MAX_CONCURRENT_GLOBAL": MAX_CONCURRENT_GLOBAL,
+        "MAX_CONCURRENT_PER_SYMBOL": MAX_CONCURRENT_PER_SYMBOL,
+        "MIN_SL_RULES": MIN_SL_RULES,
     })
 
 @app.route('/download/trades')
@@ -446,6 +523,15 @@ def dryrun():
     risk_req= float(data.get('risk_pct', 0.05))
 
     instrument = map_symbol(tv_symbol)
+
+    # Min SL enforcement (dryrun)
+    min_rule = MIN_SL_RULES.get(tv_symbol)
+    if min_rule and sl_q is not None:
+        req_delta = to_price_delta(instrument, min_rule["qty"], min_rule["kind"])
+        got_delta = to_price_delta(instrument, sl_q, sl_type)
+        if got_delta < req_delta:
+            return jsonify({'status':'error','message':f'Min SL for {tv_symbol} is {min_rule["qty"]}{min_rule["kind"]}, provided is smaller'}), 400
+
     sl_delta = to_price_delta(instrument, sl_q, sl_type)
     tp_delta = to_price_delta(instrument, tp_q, tp_type)
     sl_p = price - sl_delta if side == "BUY" else price + sl_delta
@@ -453,6 +539,10 @@ def dryrun():
 
     balance = get_oanda_balance()
     units, risk_applied = size_for_risk(tv_symbol, balance, risk_req, price, sl_p)
+
+    # Concurrency preview
+    g_count, per_counts = get_open_positions_counts()
+    per_count = per_counts.get(instrument, 0)
 
     return jsonify({
         "side": side,
@@ -463,6 +553,8 @@ def dryrun():
         "risk_pct_requested": risk_req,
         "risk_pct_applied": risk_applied,
         "units": units,
+        "open_positions_total": g_count,
+        "open_positions_for_instrument": per_count,
         "LOCAL_TEST": LOCAL_TEST,
         "note": "dry run only; nothing sent"
     })
@@ -506,6 +598,19 @@ def webhook():
                            "error", {"day_loss_pct": dlp, "limit": DAILY_LOSS_STOP_PCT})
             return jsonify({'status':'error','message':f'Daily loss stop hit ({dlp:.2f}% >= {DAILY_LOSS_STOP_PCT:.2f}%)'}), 403
 
+        # Concurrency guard
+        instrument = map_symbol(tv_symbol)
+        g_count, per_counts = get_open_positions_counts()
+        per_count = per_counts.get(instrument, 0)
+        if MAX_CONCURRENT_GLOBAL and g_count >= MAX_CONCURRENT_GLOBAL:
+            discord_notify("Trade blocked: max concurrent (global) reached",
+                           "warn", {"open_total": g_count, "limit": MAX_CONCURRENT_GLOBAL})
+            return jsonify({'status':'error','message': f'Max concurrent trades (global) reached: {g_count}/{MAX_CONCURRENT_GLOBAL}'}), 403
+        if MAX_CONCURRENT_PER_SYMBOL and per_count >= MAX_CONCURRENT_PER_SYMBOL:
+            discord_notify("Trade blocked: max concurrent (per symbol) reached",
+                           "warn", {"instrument": instrument, "open_for_symbol": per_count, "limit": MAX_CONCURRENT_PER_SYMBOL})
+            return jsonify({'status':'error','message': f'Max concurrent trades for {instrument} reached: {per_count}/{MAX_CONCURRENT_PER_SYMBOL}'}), 403
+
         # optional SL/TP & risk from payload
         sl_type = (data.get('sl_type') or "points")
         tp_type = (data.get('tp_type') or "points")
@@ -513,8 +618,15 @@ def webhook():
         tp_q  = float(data['tp']) if 'tp' in data and data['tp'] is not None else None
         risk_req = float(data.get('risk_pct', 0.05))
 
-        # symbol mapping
-        instrument = map_symbol(tv_symbol)
+        # Min SL enforcement
+        min_rule = MIN_SL_RULES.get(tv_symbol)
+        if min_rule and sl_q is not None:
+            req_delta = to_price_delta(instrument, min_rule["qty"], min_rule["kind"])
+            got_delta = to_price_delta(instrument, sl_q, sl_type)
+            if got_delta < req_delta:
+                discord_notify("Trade blocked: SL below minimum",
+                               "warn", {"symbol": tv_symbol, "min": f'{min_rule["qty"]}{min_rule["kind"]}', "got": f'{sl_q}{sl_type}'})
+                return jsonify({'status':'error','message':f'Min SL for {tv_symbol} is {min_rule["qty"]}{min_rule["kind"]}, provided is smaller'}), 400
 
         # compute SL/TP prices via deltas
         sl_p = None; tp_p = None
@@ -557,7 +669,9 @@ def webhook():
             'slPrice': sl_p, 'tpPrice': tp_p,
             'risk_pct_requested': risk_req,
             'risk_pct_applied': risk_applied,
-            'day_loss_pct': round(dlp, 3)
+            'day_loss_pct': round(dlp, 3),
+            'open_positions_total': g_count,
+            'open_positions_for_instrument': per_count
         }), 200 if status != 'error' else 500
 
     except Exception as e:
